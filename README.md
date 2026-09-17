@@ -4,7 +4,8 @@ A lightweight Python service that bridges a Danfoss ECL Comfort 110 controller (
 
 ## Features
 * **Home Assistant Auto-Discovery:** Instantly creates a device and sensors in HA without manual YAML configuration.
-* **Real-Time Monitoring:** Reads Outdoor, Room, Flow, and Return temperatures.
+* **Real-Time Monitoring:** Reads Outdoor, Room, Flow, and Return temperatures, pump status, operating state and heating-curve config.
+* **Two-Way Control:** Mode (`select`) and Room Setpoint (`number`, 15–25 °C, whole degrees) are writable from Home Assistant.
 * **Robust Reconnection:** Handles Modbus read failures and MQTT drops gracefully.
 * **Systemd Ready:** Designed to run continuously as a background service on a Raspberry Pi or Linux machine.
 
@@ -48,7 +49,7 @@ sudo systemctl start ecl110
 ## Current Status
 * [x] Read temperatures and mode (Working)
 * [x] MQTT Discovery (Working)
-* [ ] Two-way control (Write Setpoint/Mode) - *In Progress*
+* [x] Two-way control (Write Setpoint/Mode) - *Testing*
 
 ## Acknowledgments
 A massive thank you to [Ingramz/ecl110](https://github.com/Ingramz/ecl110) for documenting the Modbus registers (PNUs) for this controller. Their register map made the read/write logic of this bridge possible!

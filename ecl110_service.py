@@ -1,5 +1,5 @@
 #
-# VERSION read only
+#  VERSION write back 
 #
 #!/usr/bin/env python3
 import json, time, socket, signal, sys, threading, os, logging
@@ -32,15 +32,13 @@ MQTT_PASS    = os.getenv("MQTT_PASS")
 DISCOVERY_PREFIX = "homeassistant"
 NODE_ID      = "ecl110"
 FRIENDLY     = "ECL110"
-INTERVAL          = 60     # seconds — fast snapshot 
-CONFIG_INTERVAL   = 900    # seconds — slow snapshot
+INTERVAL     = 60          # seconds — single snapshot loop
 
 # ---------- MAPS (FW 1.08) ----------
 SENSOR_NC_RAW = 1920  # -> 192.0°C <- = disconnected S1..S4
 
-# Temperature sensors. display_name, PNU, unit, scale, (valid_min, valid_max))
-# PNU = Modbus register +1 
-# valid_min  valid_max = possibly in between  
+# Temperature sensors. display_name, PNU, unit, scale, (valid_min, valid_max)
+# PNU = Modbus register +1
 TEMPS = {
     "s1_outdoor": ("S1 Outdoor", 11201, "°C", 0.1, (-50.0,  60.0)),
     "s2_room":    ("S2 Room",    11202, "°C", 0.1, (  0.0,  50.0)),
@@ -48,32 +46,27 @@ TEMPS = {
     "s4_return":  ("S4 Return",  11204, "°C", 0.1, (  0.0, 100.0)),
 }
 
-# Room setpoint — set only to non decimal values don't know how display reatcs to 21.5
+# Room setpoint — writable via HA number entity (15..25, integer only)
 ROOM_SETPOINT = ("Room Setpoint", 11229, "°C", 0.1, (15.0, 25.0))
+ROOM_SETPOINT_STEP = 1  # integer only — panel doesn't accept half-degrees reliably
 
-# Accumulated when reached = summer cutoff 
+# Accumulated outdoor — when reached → summer cutoff
 ACC_OUTDOOR   = ("Accumulated Outdoor", 11100, "°C", 0.1, (-50.0, 60.0))
 
-# Mode: selection on the panel.
+# Mode: writable via HA select entity.
 #     0=MANUAL, 1=AUTO, 2=COMFORT, 3=SETBACK, 4=STANDBY
-# AUTO = will set mode based on timer schedule. If you have that option
-MODE          = ("Mode", 4201) 
+MODE          = ("Mode", 4201)
 MODE_MAP_FWD  = {0: "MANUAL", 1: "AUTO", 2: "COMFORT", 3: "SETBACK", 4: "STANDBY"}
+MODE_MAP_REV  = {v: k for k, v in MODE_MAP_FWD.items()}
 
-# Operating state: the sun and moon on the display
-#     2 = COMFORT (sun, S)
-#     3 = ramping toward COMFORT (S) 
-#     0 = SETBACK / standby / manual-idle (moon, M)
-#     1 = ramping toward SETBACK (M) 
-# You need to be on schedule to observer the ramping thats my assumtion
-OP_STATE      = ("State", 4211)  # wire 4210
+# Operating state: sun/moon glyph on the display (4211, wire 4210)
+OP_STATE      = ("State", 4211)
 
-# Pump status 1 / 0
-PUMP          = ("Pump", 4002)  # wire 4001
+# Pump status 1/0 (4002, wire 4001)
+PUMP          = ("Pump", 4002)
 
-# The config parameters — read on slow interval, almost never change.
+# Config parameters — slow-changing, but cheap enough to refresh every snapshot
 CONFIG = {
-    # Slope  — the heating curve steepness.
     "slope":    ("Slope",           11175, 0.1, None),
     "cut_out":  ("Heating Cut-out", 11179, 1.0, "°C"),
 }
@@ -81,32 +74,29 @@ CONFIG = {
 # MQTT topics
 AVAIL_T   = f"{NODE_ID}/status"
 STATE_T   = lambda key: f"{NODE_ID}/sensor/{key}/state"
-BSTATE_T  = lambda key: f"{NODE_ID}/binary_sensor/{key}/state"
-MODE_T    = f"{NODE_ID}/sensor/mode/state"
+MODE_T    = f"{NODE_ID}/sensor/mode/state"  # state topic shared with select entity
 CMD_MODE  = f"{NODE_ID}/cmd/mode"
 CMD_ROOM  = f"{NODE_ID}/cmd/room_setpoint"
 CMD_REFR  = f"{NODE_ID}/cmd/refresh"
 
-# Icon mapping 
+# Icon mapping
 ICONS = {
-    # Measurements — raw probe readings
     "s1_outdoor":     "mdi:thermometer",
     "s2_room":        "mdi:thermometer",
     "s3_flow":        "mdi:thermometer",
     "s4_return":      "mdi:thermometer",
-    "acc_outdoor":    "mdi:thermometer-lines",  # filtered/averaged
-    # Settings — knobs/configuration
+    "acc_outdoor":    "mdi:thermometer-lines",
     "room_setpoint":  "mdi:home-thermometer-outline",
     "mode":           "mdi:cog",
-    "slope":          "mdi:chart-bell-curve-cumulative",  
+    "slope":          "mdi:chart-bell-curve-cumulative",
     "cut_out":        "mdi:thermostat-cog",
-    # Status — live operational state
-    "state":          "mdi:theme-light-dark",  # sun/moon, matches panel glyph
+    "state":          "mdi:theme-light-dark",
     "pump":           "mdi:pump",
     "summer_standby": "mdi:white-balance-sunny",
 }
 
-# Discovery topics for entities used to publish but no longer do.
+# Discovery topics for entities we used to publish but no longer do
+# (also includes the now-superseded sensor versions of mode and room_setpoint).
 LEGACY_DISCOVERY_TOPICS = [
     f"{DISCOVERY_PREFIX}/sensor/{NODE_ID}/actual_mode/config",
     f"{DISCOVERY_PREFIX}/binary_sensor/{NODE_ID}/comfort_active/config",
@@ -115,6 +105,9 @@ LEGACY_DISCOVERY_TOPICS = [
     f"{DISCOVERY_PREFIX}/binary_sensor/{NODE_ID}/pump/config",
     f"{DISCOVERY_PREFIX}/binary_sensor/{NODE_ID}/summer_standby/config",
     f"{DISCOVERY_PREFIX}/binary_sensor/{NODE_ID}/operating_state/config",
+    # superseded by select/number entities:
+    f"{DISCOVERY_PREFIX}/sensor/{NODE_ID}/mode/config",
+    f"{DISCOVERY_PREFIX}/sensor/{NODE_ID}/room_setpoint/config",
 ]
 
 # ---------- Globals ----------
@@ -136,7 +129,6 @@ def s16(v):
     return v - 65536 if v >= 32768 else v
 
 def decode_pump_status(raw):
-    """0/1 to 'Running'/'Stopped'/'unknown'."""
     if raw is None:
         return "unknown"
     return "Running" if raw else "Stopped"
@@ -145,7 +137,6 @@ def decode_sensor(raw, scale, valid_range, key):
     if raw is None:
         return "unknown"
     sval = s16(raw)
-    # Disconnected-sensor sentinel applies only to physical S* sensors
     if sval == SENSOR_NC_RAW and key.startswith("s"):
         return "unknown"
     val = round(sval * scale, 1)
@@ -222,7 +213,6 @@ def _publish_text_sensor(cli, key, name, state_topic):
     cli.publish(cfg_t, json.dumps(cfg), qos=1, retain=True)
 
 def _publish_numeric_sensor(cli, key, name, unit=None):
-    """For non-temperature numeric values like slope """
     cfg_t = f"{DISCOVERY_PREFIX}/sensor/{NODE_ID}/{key}/config"
     cfg = {
         "name": name,
@@ -239,49 +229,62 @@ def _publish_numeric_sensor(cli, key, name, unit=None):
         cfg["icon"] = ICONS[key]
     cli.publish(cfg_t, json.dumps(cfg), qos=1, retain=True)
 
-def _publish_binary_sensor(cli, key, name, dev_cla=None):
-    cfg_t = f"{DISCOVERY_PREFIX}/binary_sensor/{NODE_ID}/{key}/config"
+def _publish_mode_select(cli):
+    cfg_t = f"{DISCOVERY_PREFIX}/select/{NODE_ID}/mode/config"
     cfg = {
-        "name": name,
-        "uniq_id": f"{NODE_ID}_{key}",
-        "stat_t": BSTATE_T(key),
+        "name": "Mode",
+        "uniq_id": f"{NODE_ID}_mode",
+        "stat_t": MODE_T,
+        "cmd_t": CMD_MODE,
         "avty_t": AVAIL_T,
         "dev": _device_dict(),
-        "pl_on": "ON",
-        "pl_off": "OFF",
+        "options": list(MODE_MAP_FWD.values()),
+        "icon": ICONS["mode"],
     }
-    if dev_cla:
-        cfg["dev_cla"] = dev_cla
+    cli.publish(cfg_t, json.dumps(cfg), qos=1, retain=True)
+
+def _publish_setpoint_number(cli):
+    lo, hi = ROOM_SETPOINT[4]
+    cfg_t = f"{DISCOVERY_PREFIX}/number/{NODE_ID}/room_setpoint/config"
+    cfg = {
+        "name": "Room Setpoint",
+        "uniq_id": f"{NODE_ID}_room_setpoint",
+        "stat_t": STATE_T("room_setpoint"),
+        "cmd_t": CMD_ROOM,
+        "avty_t": AVAIL_T,
+        "dev": _device_dict(),
+        "min": lo,
+        "max": hi,
+        "step": ROOM_SETPOINT_STEP,
+        "unit_of_meas": ROOM_SETPOINT[2],
+        "dev_cla": "temperature",
+        "mode": "box",
+        "icon": ICONS["room_setpoint"],
+    }
     cli.publish(cfg_t, json.dumps(cfg), qos=1, retain=True)
 
 def publish_discovery(cli):
-    # --- cleanup: tell HA to forget renamed/removed entities ---
+    # Tell HA to forget renamed/removed/superseded entities first
     for t in LEGACY_DISCOVERY_TOPICS:
         cli.publish(t, "", qos=1, retain=True)
 
-    # --- physical temp sensors (S1..S4) ---
+    # Physical temperature sensors (S1..S4)
     for key, (name, _pnu, unit, _scale, _range) in TEMPS.items():
         _publish_temp_sensor(cli, key, name, unit)
 
-    # --- room setpoint ---
-    _publish_temp_sensor(cli, "room_setpoint", ROOM_SETPOINT[0], ROOM_SETPOINT[2])
-
-    # --- accumulated outdoor (filtered) ---
+    # Accumulated outdoor (filtered)
     _publish_temp_sensor(cli, "acc_outdoor", ACC_OUTDOOR[0], ACC_OUTDOOR[2])
 
-    # --- mode (user/schedule selection on the panel) ---
-    _publish_text_sensor(cli, "mode", "Mode", MODE_T)
+    # Writable: room setpoint (number) and mode (select)
+    _publish_setpoint_number(cli)
+    _publish_mode_select(cli)
 
-    # --- state (sun=Comfort / moon=Setback, derived from 4211) ---
+    # Read-only status
     _publish_text_sensor(cli, "state", "State", STATE_T("state"))
-
-    # --- pump status (text sensor: Running / Stopped) ---
     _publish_text_sensor(cli, "pump", "Pump Status", STATE_T("pump"))
-
-    # --- summer standby (derived; text sensor: Yes / No) ---
     _publish_text_sensor(cli, "summer_standby", "Summer Standby", STATE_T("summer_standby"))
 
-    # --- curve config (slow refresh, read-only) ---
+    # Curve config (read-only)
     for key, (name, _pnu, _scale, unit) in CONFIG.items():
         _publish_numeric_sensor(cli, key, name, unit=unit)
 
@@ -304,17 +307,29 @@ def read_one(mod, pnu):
         log.warning(f"Read PNU {pnu} failed: {e}")
         return None
 
+def write_one(mod, pnu, value):
+    try:
+        with bus_lock:
+            r = mod.write_register(address=pnu-1, value=int(value), device_id=UNIT)
+        if isinstance(r, ExceptionResponse):
+            log.warning(f"Write PNU {pnu}={value} returned exception: {r}")
+            return False
+        return True
+    except Exception as e:
+        log.warning(f"Write PNU {pnu}={value} failed: {e}")
+        return False
+
 def publish_snapshot(cli, mod):
-    """Fast snapshot"""
+    """Single snapshot: reads everything, publishes everything, derives summer_standby."""
     cli.publish(AVAIL_T, "online", qos=1, retain=True)
 
     # 1. S1..S4 physical sensors
-    results = []
+    temp_results = []
     for key, (_name, pnu, _unit, scale, valid_range) in TEMPS.items():
         raw = read_one(mod, pnu)
         out = decode_sensor(raw, scale, valid_range, key)
         cli.publish(STATE_T(key), out, qos=0, retain=True)
-        results.append(out)
+        temp_results.append(out)
 
     # 2. Room setpoint
     _name, pnu, _unit, scale, valid_range = ROOM_SETPOINT
@@ -340,23 +355,13 @@ def publish_snapshot(cli, mod):
     state_str = decode_state(raw_op)
     cli.publish(STATE_T("state"), state_str, qos=0, retain=True)
 
-    # 6. Pump status
+    # 6. Pump
     _name, pnu = PUMP
     raw_pump = read_one(mod, pnu)
     pump_str = decode_pump_status(raw_pump)
     cli.publish(STATE_T("pump"), pump_str, qos=0, retain=True)
 
-    # 7. log line
-    temps_joined = "/".join(results)
-    log.info(
-        f"Snapshot: {temps_joined} | SP:{sp_val} acc:{acc_val} | "
-        f"mode:{mode_str} state:{state_str} | pump:{pump_str}"
-    )
-
-def publish_config_snapshot(cli, mod):
-    """
-    Slow snapshot
-    """
+    # 7. Config (slope, cut_out)
     config_values = {}
     for key, (_name, pnu, scale, _unit) in CONFIG.items():
         raw = read_one(mod, pnu)
@@ -364,33 +369,76 @@ def publish_config_snapshot(cli, mod):
         cli.publish(STATE_T(key), out, qos=0, retain=True)
         config_values[key] = out
 
-    # Derived: summer standby = (acc_outdoor >= cut_out)
-    # Re-read acc_outdoor here so the comparison is consistent (within seconds).
-    _name, pnu, _unit, scale, valid_range = ACC_OUTDOOR
-    raw_acc = read_one(mod, pnu)
-    acc_str = decode_sensor(raw_acc, scale, valid_range, "acc_outdoor")
+    # 8. Derived: summer standby = (acc_outdoor >= cut_out)
     summer = "unknown"
     try:
-        acc_f = float(acc_str)
+        acc_f = float(acc_val)
         cut_f = float(config_values.get("cut_out", "nan"))
         summer = "Yes" if acc_f >= cut_f else "No"
     except (ValueError, TypeError):
         summer = "unknown"
     cli.publish(STATE_T("summer_standby"), summer, qos=0, retain=True)
 
+    # 9. Single log line
+    temps_joined = "/".join(temp_results)
     log.info(
-        f"Config: slope={config_values.get('slope')} "
-        f"min={config_values.get('temp_min')} "
-        f"max={config_values.get('temp_max')} "
-        f"cut={config_values.get('cut_out')} | "
-        f"summer_standby={summer}"
+        f"Snapshot: {temps_joined} | SP:{sp_val} acc:{acc_val} | "
+        f"mode:{mode_str} state:{state_str} | pump:{pump_str} | "
+        f"slope={config_values.get('slope')} cut={config_values.get('cut_out')} | "
+        f"summer={summer}"
     )
+
+# ---------- Command handling ----------
+def handle_mode_cmd(cli, mod, payload):
+    sel = payload.strip().upper()
+    if sel not in MODE_MAP_REV:
+        log.warning(f"Mode '{payload}' invalid; allowed: {list(MODE_MAP_REV.keys())}")
+        return False
+    raw = MODE_MAP_REV[sel]
+    if write_one(mod, MODE[1], raw):
+        log.info(f"Mode → {sel} (raw={raw})")
+        return True
+    return False
+
+def handle_setpoint_cmd(cli, mod, payload):
+    try:
+        val = float(payload.strip())
+    except ValueError:
+        log.warning(f"Setpoint '{payload}' is not a number")
+        return False
+    lo, hi = ROOM_SETPOINT[4]
+    if not (lo <= val <= hi):
+        log.warning(f"Setpoint {val} outside allowed range {lo}..{hi}")
+        return False
+    # Force integer degrees — the panel doesn't accept 21.5 reliably,
+    # so we round here even if HA/MQTT sent a fractional value.
+    val_int = int(round(val))
+    if val_int != val:
+        log.info(f"Setpoint {val} rounded to {val_int} (integer-only)")
+    raw = val_int * 10
+    if write_one(mod, ROOM_SETPOINT[1], raw):
+        log.info(f"Setpoint → {val_int}°C (raw={raw})")
+        return True
+    return False
 
 def attach_command_handlers(cli, mod):
     def on_message(_cli, _ud, msg):
         payload = msg.payload.decode().strip()
-        log.info(f"CMD topic={msg.topic} payload='{payload}' (read-only mode; refreshing)")
-        publish_snapshot(cli, mod)  # refresh now
+        log.info(f"CMD topic={msg.topic} payload='{payload}'")
+
+        changed = False
+        if msg.topic == CMD_MODE:
+            changed = handle_mode_cmd(cli, mod, payload)
+        elif msg.topic == CMD_ROOM:
+            changed = handle_setpoint_cmd(cli, mod, payload)
+        elif msg.topic == CMD_REFR:
+            changed = True  # force a snapshot
+        else:
+            log.warning(f"Unhandled command topic: {msg.topic}")
+
+        if changed:
+            publish_snapshot(cli, mod)
+
     cli.on_message = on_message
     for t in (CMD_MODE, CMD_ROOM, CMD_REFR):
         cli.subscribe(t)
@@ -409,11 +457,7 @@ def main():
         log.info("Modbus connected")
 
     attach_command_handlers(cli, mod)
-
-    # Initial snapshots (both fast and slow)
     publish_snapshot(cli, mod)
-    publish_config_snapshot(cli, mod)
-    last_config_t = time.monotonic()
 
     try:
         while not stop_flag:
@@ -423,13 +467,7 @@ def main():
                 time.sleep(1)
             if stop_flag:
                 break
-
             publish_snapshot(cli, mod)
-
-            # Refresh config registers on the slower interval
-            if time.monotonic() - last_config_t >= CONFIG_INTERVAL:
-                publish_config_snapshot(cli, mod)
-                last_config_t = time.monotonic()
     finally:
         try: cli.publish(AVAIL_T, "offline", qos=1, retain=True)
         except Exception: pass
