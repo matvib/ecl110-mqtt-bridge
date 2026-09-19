@@ -38,13 +38,30 @@ A lightweight Python service that bridges a Danfoss ECL Comfort 110 controller (
 4. Update the `CONFIG` section in `ecl110_service.py` to match your hardware's USB port and Modbus unit ID.
 
 ## Running as a Service
-An example `ecl110.service` file is included (or can be created). Update the paths to match your installation directory, then copy it to `/etc/systemd/system/` and run:
+`ecl110.service` assumes the repo lives in `/opt/ecl110-mqtt-bridge` and runs as user `pi`. Edit `User=` and the paths if yours differ, then:
 
 ```bash
+sudo cp ecl110.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable ecl110
-sudo systemctl start ecl110
+sudo systemctl enable --now ecl110
+journalctl -u ecl110 -f
 ```
+
+## Updating from GitHub
+`deploy.sh` pulls the latest commit and restarts the service only if something changed. Let it restart without a password prompt:
+
+```bash
+chmod +x deploy.sh
+echo "$USER ALL=(root) NOPASSWD: /bin/systemctl restart ecl110" | sudo tee /etc/sudoers.d/ecl110-deploy
+```
+
+Run it by hand after a push:
+
+```bash
+./deploy.sh && journalctl -u ecl110 -f
+```
+
+Or poll automatically with a systemd timer (`ecl110-deploy.service` + `ecl110-deploy.timer`, `OnUnitActiveSec=5min`, `ExecStart=/opt/ecl110-mqtt-bridge/deploy.sh`).
 
 ## Current Status
 * [x] Read temperatures and mode (Working)
