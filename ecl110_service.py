@@ -58,6 +58,11 @@ log = logging.getLogger("ecl110")
 # ---------- MAPS (FW 1.08) ----------
 SENSOR_NC_RAW = 1920  # -> 192.0°C <- = disconnected S1..S4
 
+# HA MQTT sentinel: payload "None" sets a numeric sensor / number / select to
+# the unknown state. The string "unknown" is rejected for numeric entities
+# ("has the non-numeric value: 'unknown'") — use it only for text sensors.
+NUM_UNKNOWN = "None"
+
 # Temperature sensors. display_name, PNU, unit, scale, (valid_min, valid_max)
 # PNU = Modbus register +1
 TEMPS = {
@@ -156,20 +161,20 @@ def decode_pump_status(raw):
 
 def decode_sensor(raw, scale, valid_range, key):
     if raw is None:
-        return "unknown"
+        return NUM_UNKNOWN
     sval = s16(raw)
     if sval == SENSOR_NC_RAW and key.startswith("s"):
-        return "unknown"
+        return NUM_UNKNOWN
     val = round(sval * scale, 1)
     lo, hi = valid_range
     if not (lo <= val <= hi):
         log.warning(f"{key}: {val} outside range {lo}..{hi} (raw={raw}); reporting unknown")
-        return "unknown"
+        return NUM_UNKNOWN
     return str(val)
 
 def decode_config(raw, scale):
     if raw is None:
-        return "unknown"
+        return NUM_UNKNOWN
     sval = s16(raw)
     val = round(sval * scale, 1)
     return str(val)
@@ -367,7 +372,11 @@ def publish_snapshot(cli, mod):
     # 4. Mode (user/schedule selection)
     _name, pnu = MODE
     raw_mode = read_one(mod, pnu)
-    mode_str = MODE_MAP_FWD.get(raw_mode, f"Err({raw_mode})")
+    mode_str = MODE_MAP_FWD.get(raw_mode)
+    if mode_str is None:
+        if raw_mode is not None:
+            log.warning(f"mode: unexpected raw value {raw_mode} on 4201")
+        mode_str = NUM_UNKNOWN  # select entity: "None" = unknown, anything else must be an option
     cli.publish(MODE_T, mode_str, qos=0, retain=True)
 
     # 5. State (sun/moon glyph from 4211) — Comfort / Setback
