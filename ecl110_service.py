@@ -8,31 +8,52 @@ from pymodbus.client import ModbusSerialClient
 from pymodbus.pdu import ExceptionResponse
 from dotenv import load_dotenv
 
+# ---------- CONFIG ----------
+# Precedence: environment variable > config.json > built-in default.
+# setup.sh writes config.json; env vars / .env are handy for development.
+load_dotenv()
+CONFIG_FILE = os.getenv("ECL110_CONFIG", "/etc/ecl110-mqtt-bridge/config.json")
+
+def _load_config_file():
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+_cfg = _load_config_file()
+
+def _get(key, env, default, cast=str):
+    v = os.getenv(env)
+    if v is None:
+        v = _cfg.get(key)
+    if v is None or v == "":
+        return default
+    return cast(v)
+
+PORT         = _get("serial_port", "ECL110_PORT", "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B003297J-if00-port0")
+UNIT         = _get("unit_id",     "ECL110_UNIT", 5, int)
+BAUDRATE     = _get("baudrate",    "ECL110_BAUD", 19200, int)
+TIMEOUT_S    = 2.0
+FW_VERSION   = "1.08"
+
+MQTT_HOST    = _get("mqtt_host", "MQTT_HOST", "localhost")
+MQTT_PORT    = _get("mqtt_port", "MQTT_PORT", 1883, int)
+MQTT_USER    = _get("mqtt_user", "MQTT_USER", None)
+MQTT_PASS    = _get("mqtt_pass", "MQTT_PASS", None)
+DISCOVERY_PREFIX = _get("discovery_prefix", "DISCOVERY_PREFIX", "homeassistant").strip("/")
+NODE_ID      = _get("base_topic",  "ECL110_BASE_TOPIC",  "ecl110").strip("/")   # topic prefix + HA device id
+FRIENDLY     = _get("device_name", "ECL110_DEVICE_NAME", "ECL110")
+INTERVAL     = _get("interval",    "ECL110_INTERVAL",    60, int)   # seconds — single snapshot loop
+LOG_LEVEL    = _get("log_level",   "LOG_LEVEL", "INFO").upper()
+
 # ---------- LOGGING ----------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("ecl110")
-
-# ---------- CONFIG ----------
-load_dotenv()
-PORT         = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B003297J-if00-port0"
-UNIT         = 5
-BAUDRATE     = 19200
-TIMEOUT_S    = 2.0
-FW_VERSION   = "1.08"
-
-MQTT_HOST    = "localhost"
-MQTT_PORT    = 1883
-MQTT_USER    = os.getenv("MQTT_USER")
-MQTT_PASS    = os.getenv("MQTT_PASS")
-DISCOVERY_PREFIX = "homeassistant"
-NODE_ID      = "ecl110"
-FRIENDLY     = "ECL110"
-INTERVAL     = 60          # seconds — single snapshot loop
 
 # ---------- MAPS (FW 1.08) ----------
 SENSOR_NC_RAW = 1920  # -> 192.0°C <- = disconnected S1..S4
@@ -446,7 +467,8 @@ def attach_command_handlers(cli, mod):
 
 # ---------- Main ----------
 def main():
-    log.info(f"Starting ECL110 service | Port={PORT} Unit={UNIT} FW={FW_VERSION}")
+    log.info(f"Starting ECL110 service | Port={PORT} Unit={UNIT} FW={FW_VERSION} | "
+             f"config={CONFIG_FILE if _cfg else '(defaults/env)'} base_topic={NODE_ID}")
     cli = make_mqtt()
     publish_discovery(cli)
 
